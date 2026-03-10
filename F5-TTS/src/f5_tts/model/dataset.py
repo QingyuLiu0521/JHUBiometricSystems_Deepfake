@@ -463,6 +463,118 @@ class CustomDataset_gp_t_ctc(Dataset):
             "prompt_mel": prompt_mel
         }
 
+class CustomDataset_eval_metric(Dataset):
+    def __init__(
+        self,
+        custom_dataset: Dataset,
+        durations=None,
+        prompt_frames=None,
+        target_sample_rate=24_000,
+        hop_length=256,
+        metric="utmos", # 新增 metric 参数
+        eval_sample_rate=16_000, # 新增评估采样率
+    ):
+        self.data = custom_dataset
+        self.durations = durations
+        self.prompt_frames = prompt_frames
+        self.target_sample_rate = target_sample_rate
+        self.hop_length = hop_length
+        self.metric = metric
+        self.eval_sample_rate = eval_sample_rate
+
+    def get_frame_len(self, index):
+        if self.metric == "utmos":
+            # UTMOS 只评估生成的音频，按生成的 mel 长度排序
+            if self.prompt_frames is not None:
+                return self.prompt_frames[index]
+            return self.data[index]["prompt_frames"]
+        
+        elif self.metric == "sim":
+            # SIM 需要加载原始音频，按原始音频长度排序
+            if self.durations is not None:
+                return self.durations[index] * self.target_sample_rate / self.hop_length
+            return self.data[index]["duration"] * self.target_sample_rate / self.hop_length
+        # 默认返回生成的 mel 帧数
+        if self.prompt_frames is not None:
+            return self.prompt_frames[index]
+        return self.data[index]["prompt_frames"]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        row = self.data[index]
+        
+        # 1. 加载生成的 Mel (CPU)
+        mel_path = row["mel_path"]
+        gen_mel = torch.load(mel_path, map_location='cpu', weights_only=True)
+        # (T, Mel) -> (Mel, T)
+        gen_mel = gen_mel.transpose(0, 1)
+
+        result = {
+            "gen_mel": gen_mel,
+            "mel_path_stem": str(Path(mel_path).with_suffix("")), # 去掉 .pt
+        }
+
+        # 2. 如果是 SIM 模式，加载参考音频
+        if self.metric == "sim":
+            audio_path = row["audio_path"]
+            try:
+                wav_ref, sr = torchaudio.load(audio_path)
+                # 转单声道
+                if wav_ref.shape[0] > 1:
+                    wav_ref = torch.mean(wav_ref, dim=0, keepdim=True)
+                # 重采样到 16k (评估用)
+                if sr != self.eval_sample_rate:
+                    resampler = torchaudio.transforms.Resample(sr, self.eval_sample_rate)
+                    wav_ref = resampler(wav_ref)
+                result["ref_audio"] = wav_ref.squeeze(0) # (T,)
+            except Exception as e:
+                print(f"Error loading {audio_path}: {e}")
+                # 返回一个全0的tensor防止崩溃，长度设为16000 (1s)
+                result["ref_audio"] = torch.zeros(16000)
+
+        return result
+
+def collate_fn_eval_metric(batch):
+    # 1. Pad Generated Mel
+    gen_mels = [item["gen_mel"] for item in batch]
+    mel_lengths = torch.LongTensor([spec.shape[-1] for spec in gen_mels])
+    max_mel_len = mel_lengths.amax()
+    
+    padded_mels = []
+    for spec in gen_mels:
+        padding = (0, max_mel_len - spec.size(-1))
+        padded_spec = F.pad(spec, padding, value=0)
+        padded_mels.append(padded_spec)
+    padded_mels = torch.stack(padded_mels) # (B, Mel, T)
+
+    mel_path_stems = [item["mel_path_stem"] for item in batch]
+
+    batch_dict = {
+        "gen_mel": padded_mels,
+        "mel_lengths": mel_lengths,
+        "mel_path_stems": mel_path_stems
+    }
+
+    # 2. Pad Reference Audio (仅 Sim 模式)
+    if "ref_audio" in batch[0]:
+        ref_audios = [item["ref_audio"] for item in batch]
+        ref_lengths = torch.LongTensor([wav.shape[-1] for wav in ref_audios])
+        max_audio_len = ref_lengths.amax()
+        
+        padded_refs = []
+        for wav in ref_audios:
+            padding = (0, max_audio_len - wav.size(-1))
+            padded_wav = F.pad(wav, padding, value=0)
+            padded_refs.append(padded_wav)
+            
+        padded_refs = torch.stack(padded_refs) # (B, T)
+        batch_dict["ref_audio"] = padded_refs
+        batch_dict["ref_lengths"] = ref_lengths
+
+    return batch_dict
+
 # Dynamic Batch Sampler
 class DynamicBatchSampler(Sampler[list[int]]):
     """Extension of Sampler that will do the following:
@@ -874,3 +986,38 @@ def collate_fn_gp_ctc(batch):
         total_text_lengths=total_text_lengths,
         prompt_mel_lengths=prompt_mel_lengths,
     )
+    
+def load_dataset_eval_metric(
+    dataset_name: str,
+    tokenizer: str = "pinyin",
+    dataset_type: str = "CustomDataset",
+    target_sample_rate: int = 24000,
+    hop_length: int = 256,
+    metric: str = "utmos" # 传入 metric
+) -> CustomDataset_eval_metric:
+    
+    print(f"Loading dataset {dataset_name} for {metric} evaluation ...")
+    
+    if dataset_type == "CustomDataset":
+        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}_gp_t"))
+        try:
+            raw_dataset = load_from_disk(f"{rel_data_path}/raw")
+        except:
+            raw_dataset = Dataset_.from_file(f"{rel_data_path}/raw.arrow")
+        
+        with open(f"{rel_data_path}/duration.json", "r", encoding="utf-8") as f:
+            data_dict = json.load(f)
+        durations = data_dict["duration"]
+        prompt_frames = data_dict.get("prompt_frames", None)
+        
+        eval_dataset = CustomDataset_eval_metric(
+            raw_dataset,
+            durations=durations,
+            prompt_frames=prompt_frames,
+            target_sample_rate=target_sample_rate,
+            hop_length=hop_length,
+            metric=metric # 传递参数
+        )
+        return eval_dataset
+    else:
+        raise ValueError(f"Unsupported dataset_type: {dataset_type}")

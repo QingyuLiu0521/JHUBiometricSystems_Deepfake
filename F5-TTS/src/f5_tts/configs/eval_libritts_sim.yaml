@@ -1,0 +1,13 @@
+datasets:
+  name: LibriTTS_100_360_500  # dataset name
+  batch_size_per_gpu: 38400  # 8 GPUs, 8 * 38400 = 307200
+  batch_size_type: frame  # frame | sample
+  max_samples: 64  # max sequences per batch
+  num_workers: 16
+  tokenizer: char  # tokenizer type
+
+eval:
+  metric: sim  # utmos | sim
+  vocoder_local_path: /vepfs/group09/pretrain_ckpts/checkpoints/vocos-mel-24khz/
+  wavlm_ckpt_path: /vepfs/group09/pretrain_ckpts/checkpoints/wavlm_large_finetune.pth
+  target_sample_rate: 24000
